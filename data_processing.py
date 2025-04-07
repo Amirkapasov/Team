@@ -1,98 +1,139 @@
-
-
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import SelectKBest, f_regression
 
-def load_data(train_file, test_file, sample_submission_file):
-    """Load the datasets from the provided file paths."""
-    train_df = pd.read_csv(train_file)
-    test_df = pd.read_csv(test_file)
-    sample_submission = pd.read_csv(sample_submission_file)
-    return train_df, test_df, sample_submission
+# Настройки отображения
+sns.set_style("whitegrid")
+plt.style.use('ggplot')
+pd.set_option('display.max_columns', 100)
+np.random.seed(42)
 
-def preprocess_data(train_df, test_df):
-    """Preprocess the data: handle missing values, one-hot encoding, scaling."""
-    # Сохраняем целевую переменную и идентификаторы
-    target = train_df['final_math_score']
-    train_ids = train_df['student_id']
-    test_ids = test_df['student_id']
 
-    train_df = train_df.drop(columns=['final_math_score'])
+def load_data():
+    """Загрузка и объединение данных"""
+    train = pd.read_csv('student_performance_train.csv')
+    test = pd.read_csv('student_performance_test.csv')
+    return train, test
 
-    # Заполнение пропусков
-    train_df = train_df.fillna(train_df.mean(numeric_only=True))
-    test_df = test_df.fillna(test_df.mean(numeric_only=True))
 
-    # One-hot encoding
-    train_df = pd.get_dummies(train_df, drop_first=True)
-    test_df = pd.get_dummies(test_df, drop_first=True)
+def preprocess_data(train, test):
+    """Улучшенная предобработка данных"""
+    y_train = train['final_math_score']
+    train_ids = train['student_id']
+    test_ids = test['student_id']
 
-    # Выравнивание колонок
-    test_df = test_df.reindex(columns=train_df.columns, fill_value=0)
+    combined = pd.concat([train.drop('final_math_score', axis=1), test])
 
-    # Масштабирование
-    scaler = StandardScaler()
-    train_df = pd.DataFrame(scaler.fit_transform(train_df), columns=train_df.columns)
-    test_df = pd.DataFrame(scaler.transform(test_df), columns=test_df.columns)
+    # Расширенный feature engineering
+    combined['efficiency_ratio'] = combined['previous_scores'] / (combined['study_hours'] + 1e-6)
+    combined['attendance_impact'] = combined['previous_scores'] * (combined['attendance_rate'] / 100)
+    combined['parent_edu_encoded'] = combined['parental_education'].map(
+        {'High School': 1, 'Bachelor’s': 2, 'Master’s': 3})
+    combined['study_attendance_interaction'] = combined['study_hours'] * combined['attendance_rate']
+    combined['score_trend'] = combined.groupby('parental_education')['previous_scores'].transform('mean')
 
-    # Добавим обратно ID и цель
-    train_df['student_id'] = train_ids.values
-    train_df['final_math_score'] = target.values
-    test_df['student_id'] = test_ids.values
+    # Обработка выбросов
+    combined['study_hours'] = np.clip(combined['study_hours'], 1, 20)
 
-    return train_df, test_df, scaler
+    # Обработка пропущенных значений
+    num_cols = combined.select_dtypes(include=np.number).columns
+    cat_cols = ['gender', 'parental_education', 'school_type']
 
-def train_model(train_df):
-    """Train a Random Forest model using the training data."""
-    X = train_df.drop(['final_math_score', 'student_id'], axis=1)
-    y = train_df['final_math_score']
+    combined[num_cols] = SimpleImputer(strategy='median').fit_transform(combined[num_cols])
+    combined[cat_cols] = SimpleImputer(strategy='most_frequent').fit_transform(combined[cat_cols])
 
-    X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Выбор фичей
+    num_features = ['age', 'study_hours', 'attendance_rate', 'previous_scores',
+                    'extracurricular', 'efficiency_ratio', 'attendance_impact',
+                    'parent_edu_encoded', 'study_attendance_interaction', 'score_trend']
+    cat_features = ['gender', 'school_type', 'parental_education']
 
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
+    # Пайплайн предобработки
+    preprocessor = ColumnTransformer([
+        ('num', Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler()),
+            ('selector', SelectKBest(f_regression, k=8))
+        ]), num_features),
+        ('cat', OneHotEncoder(handle_unknown='ignore'), cat_features)
+    ])
 
-    y_valid_pred = model.predict(X_valid)
-    mse = mean_squared_error(y_valid, y_valid_pred)
-    print(f"Mean Squared Error on validation set: {mse:.2f}")
+    X_train = combined.iloc[:len(train)]
+    X_test = combined.iloc[len(train):]
 
-    return model
+    X_train_processed = preprocessor.fit_transform(X_train, y_train)
+    X_test_processed = preprocessor.transform(X_test)
 
-def make_predictions(model, test_df):
-    """Use the trained model to make predictions on the test set."""
-    X_test = test_df.drop(['student_id'], axis=1)
-    return model.predict(X_test)
+    return X_train_processed, y_train, X_test_processed, test_ids, preprocessor
 
-def prepare_submission(test_df, y_test_pred, output_file):
-    """Prepare the submission file."""
+
+def train_model(X_train, y_train):
+    """Улучшенное обучение модели"""
+    param_grid = {
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [3, 5, 7],
+        'n_estimators': [500, 700],
+        'subsample': [0.7, 0.9],
+        'colsample_bytree': [0.7, 0.9]
+    }
+
+    model = XGBRegressor(random_state=42, tree_method='hist')
+    kfold = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    grid_search = GridSearchCV(model, param_grid, cv=kfold,
+                               scoring='neg_mean_squared_error',
+                               n_jobs=-1, verbose=1)
+    grid_search.fit(X_train, y_train)
+
+    best_model = grid_search.best_estimator_
+    print(f"Best parameters: {grid_search.best_params_}")
+
+    return best_model
+
+
+def create_submission(model, X_test, test_ids, filename='improved_submission.csv'):
+    predictions = model.predict(X_test)
+    predictions = np.clip(predictions, 0, 100)
+
     submission = pd.DataFrame({
-        'student_id': test_df['student_id'],
-        'predicted_math_score': np.clip(y_test_pred, 0, 100)  # Обрезаем от 0 до 100
+        'student_id': test_ids,
+        'predicted_math_score': np.round(predictions, 1)
     })
-    submission.to_csv(output_file, index=False)
-    print(f"Submission saved to {output_file}")
 
-# --- data_analysis.py ---
+    plt.figure(figsize=(10, 6))
+    sns.histplot(submission['predicted_math_score'], bins=30, kde=True)
+    plt.title('Improved Distribution of Predicted Math Scores')
+    plt.savefig('prediction_distribution.png', bbox_inches='tight')
 
-from data_processing import load_data, preprocess_data, train_model, make_predictions, prepare_submission
+    submission.to_csv(filename, index=False)
+    return submission
 
-# Step 1: Load data
-train_df, test_df, sample_submission = load_data('student_performance_train.csv',
-                                                 'student_performance_test.csv',
-                                                 'sample_submission.csv')
 
-# Step 2: Preprocess data
-train_df, test_df, scaler = preprocess_data(train_df, test_df)
+def main():
+    train, test = load_data()
+    X_train, y_train, X_test, test_ids, _ = preprocess_data(train, test)
 
-# Step 3: Train the model
-model = train_model(train_df)
+    # Анализ целевой переменной
+    plt.figure(figsize=(10, 6))
+    sns.histplot(y_train, bins=30, kde=True)
+    plt.title('Distribution of Target Variable (final_math_score)')
+    plt.savefig('target_distribution.png', bbox_inches='tight')
 
-# Step 4: Make predictions on the test data
-y_test_pred = make_predictions(model, test_df)
+    model = train_model(X_train, y_train)
+    submission = create_submission(model, X_test, test_ids)
+    print("\nSubmission summary:")
+    print(submission.describe())
 
-# Step 5: Prepare and save the final submission
-prepare_submission(test_df, y_test_pred, 'submission.csv')
+
+if __name__ == "__main__":
+    main()
+
