@@ -13,6 +13,6 @@ Python Django MySQL
 📡 Contact Me
 📩 Email: kapasovamir777@gmail.com
 📱 Telegram: @asetovvich
-📸 Instagram: Asetovvich_
+📸 Instagram: asetovvich_
 
 💡 "Turning ideas into reality through code." 🚀
